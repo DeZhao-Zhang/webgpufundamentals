@@ -63,24 +63,36 @@ async function main() {
         scale: vec2f,
       };
 
-      @group(0) @binding(0) var<uniform> ourStruct: OurStruct;
-      @group(0) @binding(1) var<uniform> otherStruct: OtherStruct;
+      struct VSOutput {
+        @builtin(position) position: vec4f,
+        @location(0) color: vec4f,
+      }
+
+      @group(0) @binding(0) var<storage,read> ourStructs: array<OurStruct>;
+      @group(0) @binding(1) var<storage,read> otherStructs: array<OtherStruct>;
 
       @vertex fn vs(
-        @builtin(vertex_index) vertexIndex : u32
-      ) -> @builtin(position) vec4f {
+        @builtin(vertex_index) vertexIndex : u32,
+        @builtin(instance_index) instanceIndex : u32
+      ) -> VSOutput {
         let pos = array(
           vec2f( 0.0,  0.5),  // top center
           vec2f(-0.5, -0.5),  // bottom left
           vec2f( 0.5, -0.5)   // bottom right
         );
 
-        return vec4f(
-          pos[vertexIndex] * otherStruct.scale + ourStruct.offset, 0.0, 1.0);
+        let otherStruct = otherStructs[instanceIndex];
+        let ourStruct = ourStructs[instanceIndex];
+
+        var vsOut : VSOutput;
+        vsOut.position = vec4f(
+            pos[vertexIndex] * otherStruct.scale + ourStruct.offset, 0.0, 1.0);
+        vsOut.color = ourStruct.color;
+        return vsOut;
       }
 
-      @fragment fn fs() -> @location(0) vec4f {
-        return ourStruct.color;
+      @fragment fn fs(vsOut : VSOutput) -> @location(0) vec4f {
+        return vsOut.color;
       }
     `,
   });
@@ -99,13 +111,29 @@ async function main() {
     },
   });
 
+  const kNumObjects = 100;
+  const objectInfos = [];
   // create 2 buffers for the uniform values
-  const staticUniformBufferSize =
+  const staticUnitSize =
     4 * 4 + // color is 4 32bit floats (4bytes each)
     2 * 4 + // offset is 2 32bit floats (4bytes each)
     2 * 4;  // padding
-  const uniformBufferSize =
+  const changingUnitSize =
     2 * 4;  // scale is 2 32bit floats (4bytes each)
+  const staticStorageBufferSize = staticUnitSize * kNumObjects;
+  const changingStorageBufferSize = changingUnitSize * kNumObjects;
+
+  const staticStorageBuffer = device.createBuffer({
+    lable: 'static storage for objects',
+    size: staticStorageBufferSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+
+  const changingStorageBuffer = device.createBuffer({
+    lable: 'changing storage for objects',
+    size: changingStorageBufferSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
 
   // offsets to the various uniform values in float32 indices
   const kColorOffset = 0;
@@ -113,50 +141,35 @@ async function main() {
 
   const kScaleOffset = 0;
 
-  const kNumObjects = 100;
-  const objectInfos = [];
 
-  for (let i = 0; i < kNumObjects; ++i) {
-    const staticUniformBuffer = device.createBuffer({
-      label: `static uniforms for obj: ${i}`,
-      size: staticUniformBufferSize,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+  {
+    const staticStorageValues = new Float32Array(staticStorageBufferSize / 4);
+    for (let i = 0; i < kNumObjects; ++i) {
+      const staticOffset = i * (staticUnitSize / 4);
 
-    // These are only set once so set them now
-    {
-      const uniformValues = new Float32Array(staticUniformBufferSize / 4);
-      uniformValues.set([rand(), rand(), rand(), 1], kColorOffset);        // set the color
-      uniformValues.set([rand(-0.9, 0.9), rand(-0.9, 0.9)], kOffsetOffset);      // set the offset
+      // These are only set once so set them now
+      staticStorageValues.set([rand(), rand(), rand(), 1], staticOffset + kColorOffset);        // set the color
+      staticStorageValues.set([rand(-0.9, 0.9), rand(-0.9, 0.9)], staticOffset + kOffsetOffset);      // set the offset
 
-      // copy these values to the GPU
-      device.queue.writeBuffer(staticUniformBuffer, 0, uniformValues);
+      objectInfos.push({
+        scale: rand(0.2, 0.5),
+      });
     }
 
-    // create a typedarray to hold the values for the uniforms in JavaScript
-    const uniformValues = new Float32Array(uniformBufferSize / 4);
-    const uniformBuffer = device.createBuffer({
-      label: `changing uniforms for obj: ${i}`,
-      size: uniformBufferSize,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    const bindGroup = device.createBindGroup({
-      label: `bind group for obj: ${i}`,
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: staticUniformBuffer }},
-        { binding: 1, resource: { buffer: uniformBuffer }},
-      ],
-    });
-
-    objectInfos.push({
-      scale: rand(0.2, 0.5),
-      uniformBuffer,
-      uniformValues,
-      bindGroup,
-    });
+    device.queue.writeBuffer(staticStorageBuffer, 0, staticStorageValues);
   }
+
+  const storageValues = new Float32Array(changingStorageBufferSize / 4);
+
+  const bindGroup = device.createBindGroup({
+    label: 'bind group for objects',
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: staticStorageBuffer }},
+      { binding: 1, resource: { buffer: changingStorageBuffer }},
+    ],
+  })
+
 
   const renderPassDescriptor = {
     label: 'our basic canvas renderPass',
@@ -183,14 +196,15 @@ async function main() {
     // Set the uniform values in our JavaScript side Float32Array
     const aspect = canvas.width / canvas.height;
 
-    for (const {scale, bindGroup, uniformBuffer, uniformValues} of objectInfos) {
-      uniformValues.set([scale / aspect, scale], kScaleOffset); // set the scale
-      device.queue.writeBuffer(uniformBuffer, 0, uniformValues);
+    objectInfos.forEach(({scale}, ndx) => {
+      const offset = ndx * (changingUnitSize / 4);
+      storageValues.set([scale / aspect, scale], offset + kScaleOffset)
+    })
+    device.queue.writeBuffer(changingStorageBuffer, 0, storageValues);
 
-      pass.setBindGroup(0, bindGroup);
-      pass.draw(3);  // call our vertex shader 3 times
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3, kNumObjects);
 
-    }
     pass.end();
 
     const commandBuffer = encoder.finish();
